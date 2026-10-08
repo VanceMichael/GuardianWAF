@@ -142,6 +142,17 @@ func (trl *TenantRateLimiter) Count(tenantID string) int64 {
 	return tracker.Count()
 }
 
+// RemoveTenant immediately drops the rate tracker for a tenant. Used by the
+// tenant deletion commit so a deleted tenant's minute/hour windows cannot
+// linger (and be inherited if an ID is ever reused) until the periodic
+// Cleanup sweep.
+func (trl *TenantRateLimiter) RemoveTenant(tenantID string) {
+	trl.mu.Lock()
+	defer trl.mu.Unlock()
+
+	delete(trl.trackers, tenantID)
+}
+
 // Cleanup removes old trackers for tenants that haven't made requests recently.
 func (trl *TenantRateLimiter) Cleanup(maxAge time.Duration) {
 	trl.mu.Lock()

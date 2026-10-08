@@ -81,10 +81,14 @@ func (d *Dashboard) handleTenantDeleteCompat(w http.ResponseWriter, r *http.Requ
 		writeTenantDisabled(w)
 		return
 	}
-	if err := d.getTenantManager().DeleteTenant(r.PathValue("id")); err != nil {
-		writeError(w, http.StatusNotFound, sanitizeErr(err))
+	id := r.PathValue("id")
+	if err := d.getTenantManager().DeleteTenant(id); err != nil {
+		writeError(w, tenantDeleteStatus(err), sanitizeErr(err))
 		return
 	}
+	// Match the admin route's authentication-cache invalidation so the
+	// deleted tenant's key cannot keep authenticating via this route.
+	d.SetTenantAPIKey(id, "")
 	writeJSON(w, http.StatusNoContent, nil)
 }
 

@@ -234,12 +234,27 @@ func (h *TenantAdminHandler) deleteTenant(w http.ResponseWriter, r *http.Request
 	}
 
 	if err := h.getManager().DeleteTenant(tenantID); err != nil {
-		writeError(w, http.StatusNotFound, sanitizeErr(err))
+		writeError(w, tenantDeleteStatus(err), sanitizeErr(err))
 		return
 	}
+	// The cached key hash must be dropped only after a successful commit: on
+	// a failed delete the tenant still exists and its key must keep working.
 	h.dashboard.SetTenantAPIKey(tenantID, "")
 
 	writeJSON(w, http.StatusNoContent, nil)
+}
+
+// tenantDeleteStatus maps a manager deletion error to its HTTP status. A
+// missing tenant is 404; any other error is a failed commit (e.g. persistence
+// failure with the old tenant retained) and must surface as 500 so callers
+// know the delete did not happen and can retry. The dashboard package stays
+// decoupled from the tenant package (managers are injected via an interface),
+// so not-found is recognized by the managers' conventional error text.
+func tenantDeleteStatus(err error) int {
+	if err != nil && strings.Contains(err.Error(), "not found") {
+		return http.StatusNotFound
+	}
+	return http.StatusInternalServerError
 }
 
 // sanitizeTenantResponse strips sensitive fields from a tenant object before it

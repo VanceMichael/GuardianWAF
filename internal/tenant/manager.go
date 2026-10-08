@@ -9,9 +9,11 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,6 +24,11 @@ import (
 	logging "github.com/guardianwaf/guardianwaf/internal/logging"
 	"github.com/guardianwaf/guardianwaf/internal/netutil"
 )
+
+// ErrTenantNotFound is returned when an operation targets a tenant ID that
+// does not exist. HTTP handlers map it to 404; every other deletion error is
+// a failed commit reported as 5xx.
+var ErrTenantNotFound = errors.New("tenant not found")
 
 // Tenant represents a single tenant with isolated WAF configuration.
 type Tenant struct {
@@ -611,47 +618,88 @@ func (m *Manager) UpdateTenant(id string, updates *TenantUpdate) error {
 	return nil
 }
 
-// DeleteTenant deletes a tenant.
+// DeleteTenant deletes a tenant with a single all-or-nothing commit shared
+// by every management entry point (dashboard admin API, compatibility REST
+// routes, and the internal tenant handler).
+//
+// Ordering:
+//  1. Persistence first. If the tenant JSON file or index.json cannot be
+//     updated, the error is returned and no runtime state is touched, so the
+//     old tenant stays fully functional and the call remains retryable — a
+//     successful response can never be followed by a resurrected tenant
+//     after restart, and a failed response can never leave runtime/restart
+//     state split.
+//  2. Identity commit: domain index, tenant map and API-key cache, plus a
+//     deterministic default-tenant reassignment.
+//  3. Ephemeral runtime purge: tenant rules, minute/hour rate trackers,
+//     alerts and alert cooldowns. Billing records and audit history are
+//     intentionally retained (they are keyed by tenant ID under a separate
+//     retention policy) and remain queryable after deletion.
+//
+// The cluster delete event is broadcast only after the commit succeeds.
 func (m *Manager) DeleteTenant(id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	tenant, exists := m.tenants[id]
 	if !exists {
-		return fmt.Errorf("tenant %s not found", id)
+		return fmt.Errorf("tenant %s not found: %w", id, ErrTenantNotFound)
 	}
 
-	// Remove domain mappings
+	// Phase 1: durable commit before any runtime mutation.
+	if m.store != nil {
+		if err := m.store.DeleteTenant(id); err != nil {
+			return fmt.Errorf("delete tenant %s: %w", id, err)
+		}
+	}
+
+	// Phase 2: commit the in-memory identity state.
 	for _, domain := range tenant.Domains {
 		delete(m.domains, domainKey(domain))
 	}
-
 	delete(m.tenants, id)
 	m.invalidateAPIKeyCache()
 
-	// Update default tenant if needed
 	if m.defaultTenantID == id {
-		m.defaultTenantID = ""
-		for tid := range m.tenants {
-			m.defaultTenantID = tid
-			break
-		}
+		m.defaultTenantID = deterministicDefaultTenantID(m.tenants)
 	}
 
-	// Delete from persistent storage
-	if m.store != nil {
-		if err := m.store.DeleteTenant(id); err != nil {
-			// Non-fatal: log but don't fail
-			m.log.Warn("failed to delete tenant from storage", "err", err)
-		}
+	// Phase 3: purge ephemeral per-tenant runtime state. Billing and audit
+	// history are deliberately NOT purged (retention policy; keyed by ID).
+	if m.rulesManager != nil {
+		m.rulesManager.DeleteTenantRules(id)
+	}
+	if m.rateLimiter != nil {
+		m.rateLimiter.RemoveTenant(id)
+	}
+	if m.hourLimiter != nil {
+		m.hourLimiter.RemoveTenant(id)
+	}
+	if m.alertManager != nil {
+		m.alertManager.PurgeTenant(id)
 	}
 
-	// Broadcast to cluster
+	// Broadcast to cluster only after a successful commit.
 	m.broadcast("tenant", id, "delete", map[string]any{
 		"id": id,
 	})
 
 	return nil
+}
+
+// deterministicDefaultTenantID picks the default tenant after a deletion
+// without relying on randomized map iteration: the smallest remaining ID
+// wins, and "" is returned when no tenants remain.
+func deterministicDefaultTenantID(tenants map[string]*Tenant) string {
+	if len(tenants) == 0 {
+		return ""
+	}
+	ids := make([]string, 0, len(tenants))
+	for id := range tenants {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids[0]
 }
 
 // RegenerateAPIKey generates a new API key for a tenant.
@@ -1148,14 +1196,10 @@ func waitForTenantBroadcast(ctx context.Context, wg *sync.WaitGroup) error {
 	}
 }
 
-// DeleteTenant deletes a tenant and cleans up all associated resources.
+// DeleteTenantWithCleanup is kept for API compatibility. DeleteTenant now
+// performs the full runtime purge (rules, rate trackers, alerts/cooldowns)
+// as part of its single commit, so this is a plain delegation.
 func (m *Manager) DeleteTenantWithCleanup(id string) error {
-	// Delete tenant rules
-	if m.rulesManager != nil {
-		m.rulesManager.DeleteTenantRules(id)
-	}
-
-	// Delete tenant
 	return m.DeleteTenant(id)
 }
 

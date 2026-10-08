@@ -317,7 +317,17 @@ func (s *Store) LoadAllTenants() ([]*Tenant, error) {
 	return tenants, nil
 }
 
-// DeleteTenant removes a tenant from disk.
+// DeleteTenant removes a tenant from disk and from the index.
+//
+// It implements an all-or-nothing commit so that a returned error always
+// leaves the on-disk state intact and the operation is retryable: the data
+// file is removed first (LoadAllTenants rebuilds state by scanning files, so
+// a crash in the middle can never resurrect a deleted tenant), and the index
+// is updated afterwards. If the index update fails, the in-memory index is
+// rolled back and the data file is restored from the bytes read before the
+// removal; if that rollback also fails, both errors are reported instead of
+// silently diverging. Deleting an unknown tenant is idempotent and returns
+// nil.
 func (s *Store) DeleteTenant(tenantID string) error {
 	filename, err := tenantFilename(tenantID)
 	if err != nil {
@@ -335,23 +345,91 @@ func (s *Store) DeleteTenant(tenantID string) error {
 	if err != nil {
 		return err
 	}
+
+	// Snapshot the current data file for rollback. A read failure other than
+	// "not present" aborts before anything is mutated.
 	// #nosec G304 -- tenant filename is derived from a validated tenant ID and constrained to the store directory.
+	backup, readErr := os.ReadFile(path)
+	fileExisted := readErr == nil
+	if readErr != nil && !os.IsNotExist(readErr) {
+		return fmt.Errorf("reading tenant file before delete: %w", readErr)
+	}
+
+	// Remove the data file first: filesystem scans are the source of truth on
+	// restart, so every crash window from here on resolves to "deleted" and
+	// never to a resurrected tenant.
+	// #nosec G304 -- see above: validated path inside the store directory.
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		// Nothing was mutated (e.g. a read-only store directory): the tenant
+		// remains fully present and the caller can retry.
 		return fmt.Errorf("removing tenant file: %w", err)
 	}
 
-	delete(s.index, tenantID)
-	return s.saveIndex()
+	// Update the index atomically, keeping the previous in-memory map intact
+	// until the write succeeds so it can be restored on failure.
+	previousIndex := s.index
+	updatedIndex := make(map[string]string, len(previousIndex))
+	for k, v := range previousIndex {
+		updatedIndex[k] = v
+	}
+	delete(updatedIndex, tenantID)
+	s.index = updatedIndex
+	if err := s.saveIndex(); err != nil {
+		restoreErr := s.rollbackTenantDelete(tenantID, filename, previousIndex, path, backup, fileExisted)
+		if restoreErr != nil {
+			return fmt.Errorf("updating tenant index: %w (rollback failed: %v)", err, restoreErr)
+		}
+		return fmt.Errorf("updating tenant index: %w (state restored)", err)
+	}
+
+	return nil
 }
 
-// saveIndex persists the index file.
+// rollbackTenantDelete restores the in-memory index and the removed tenant
+// data file after a failed index update, returning an error if the file
+// could not be restored.
+func (s *Store) rollbackTenantDelete(tenantID, filename string, previousIndex map[string]string, path string, backup []byte, fileExisted bool) error {
+	s.index = previousIndex
+
+	// The file never existed (delete of an unknown tenant): there is nothing
+	// to restore; keeping the absent index entry would point at a missing
+	// file, so drop it from the restored map as well.
+	if !fileExisted {
+		delete(s.index, tenantID)
+		return nil
+	}
+
+	// Best-effort atomic restore of the data file.
+	tmp := path + ".restore.tmp"
+	if err := os.WriteFile(tmp, backup, 0600); err != nil {
+		return fmt.Errorf("restoring tenant file: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("restoring tenant file: %w", err)
+	}
+	// Keep the restored filename referenced by the recovered index.
+	s.index[tenantID] = filename
+	return nil
+}
+
+// saveIndex persists the index file atomically (temp file + rename) so a
+// crash mid-write can never leave a torn index.json behind.
 func (s *Store) saveIndex() error {
-	indexPath := filepath.Join(s.basePath, "index.json")
 	data, err := json.MarshalIndent(s.index, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(indexPath, data, 0600)
+	indexPath := filepath.Join(s.basePath, "index.json")
+	tmp := indexPath + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return fmt.Errorf("writing tenant index: %w", err)
+	}
+	if err := os.Rename(tmp, indexPath); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("renaming tenant index: %w", err)
+	}
+	return nil
 }
 
 // tenantData is the serialized representation of a tenant.

@@ -289,7 +289,14 @@ func (h *Handlers) updateTenant(w http.ResponseWriter, r *http.Request, tenantID
 
 func (h *Handlers) deleteTenant(w http.ResponseWriter, r *http.Request, tenantID string) {
 	if err := h.manager.DeleteTenant(tenantID); err != nil {
-		http.Error(w, sanitizeErr(err), http.StatusNotFound)
+		// A missing tenant is a 404; a failed commit (e.g. persistence
+		// failure with the old tenant retained) is a 500 so callers know the
+		// delete did not happen and can retry.
+		status := http.StatusInternalServerError
+		if errors.Is(err, ErrTenantNotFound) {
+			status = http.StatusNotFound
+		}
+		http.Error(w, sanitizeErr(err), status)
 		return
 	}
 

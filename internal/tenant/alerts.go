@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -260,6 +261,24 @@ func (am *AlertManager) ClearAlerts(tenantID string) {
 	defer am.mu.Unlock()
 
 	delete(am.alerts, tenantID)
+}
+
+// PurgeTenant removes every runtime alerting state for a tenant: its alert
+// history and all per-alert-type cooldown entries. Used by the tenant
+// deletion commit so cooldown suppression (keyed "tenantID:alertType") cannot
+// carry over to a later tenant that happens to reuse the same ID. The
+// trailing ":" prefix prevents one tenant ID from matching another's prefix.
+func (am *AlertManager) PurgeTenant(tenantID string) {
+	am.mu.Lock()
+	defer am.mu.Unlock()
+
+	delete(am.alerts, tenantID)
+	cooldownPrefix := tenantID + ":"
+	for key := range am.cooldowns {
+		if strings.HasPrefix(key, cooldownPrefix) {
+			delete(am.cooldowns, key)
+		}
+	}
 }
 
 // GetActiveAlertCount returns the number of unacknowledged alerts.
