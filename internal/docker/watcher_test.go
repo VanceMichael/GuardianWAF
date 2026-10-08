@@ -1,6 +1,7 @@
 package docker
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -83,26 +84,35 @@ func TestWatcher_SetLogger(t *testing.T) {
 	}
 }
 
-func TestWatcher_HandleEvent_Start(t *testing.T) {
-	w := NewWatcher(nil, "gwaf", "bridge", 5*time.Second)
-	var logs []string
-	w.SetLogger(func(_, msg string) { logs = append(logs, msg) })
-
-	// Start event will call sync() which tries to list containers.
-	// With nil client, dockerCmd will panic on nil pointer.
-	// So we skip testing start event with nil client.
-	// Instead verify stop/destroy/die events work without client.
+// lifecycleEventClient returns a client whose ListContainers serves one
+// labeled container on the first round and an empty list afterwards,
+// simulating the container disappearing from `docker ps` after a lifecycle
+// event. Used by the event tests that must converge through a snapshot.
+func lifecycleEventClient(t *testing.T) *Client {
+	t.Helper()
+	psCalls := 0
+	return makeClientWithCmdFunc(func(_ context.Context, args ...string) (string, error) {
+		if len(args) > 0 && args[0] == "ps" {
+			psCalls++
+			if psCalls == 1 {
+				return `{"ID":"abc123"}`, nil
+			}
+			return "", nil
+		}
+		return makeInspectJSON("abc123", "test-app", "test.example.com", "8080"), nil
+	})
 }
 
 func TestWatcher_HandleEvent_Stop(t *testing.T) {
-	w := NewWatcher(nil, "gwaf", "bridge", 5*time.Second)
-	w.services["abc123"] = &DiscoveredService{ContainerID: "abc123", ContainerName: "test"}
+	w := NewWatcher(lifecycleEventClient(t), "gwaf", "bridge", 5*time.Second)
+	w.SetLogger(func(_, _ string) {})
 
-	var logs []string
-	w.SetLogger(func(_, msg string) { logs = append(logs, msg) })
+	if !w.sync() {
+		t.Fatal("expected baseline sync to establish the service")
+	}
 
-	changed := false
-	w.SetOnChange(func() { changed = true })
+	notifications := 0
+	w.SetOnChange(func() { notifications++ })
 
 	w.handleEvent(Event{
 		Type:   "container",
@@ -116,28 +126,39 @@ func TestWatcher_HandleEvent_Stop(t *testing.T) {
 		},
 	})
 
+	// Removal must be confirmed through the new snapshot, not a direct map
+	// delete.
 	if w.ServiceCount() != 0 {
 		t.Errorf("service should be removed, got %d", w.ServiceCount())
 	}
-	if !changed {
-		t.Error("onChange should have been called")
+	if notifications != 1 {
+		t.Errorf("expected exactly 1 onChange, got %d", notifications)
 	}
 }
 
 func TestWatcher_HandleEvent_Destroy(t *testing.T) {
-	w := NewWatcher(nil, "gwaf", "bridge", 5*time.Second)
-	w.services["xyz789"] = &DiscoveredService{ContainerID: "xyz789"}
+	w := NewWatcher(lifecycleEventClient(t), "gwaf", "bridge", 5*time.Second)
+	w.SetLogger(func(_, _ string) {})
+	if !w.sync() {
+		t.Fatal("expected baseline sync to establish the service")
+	}
+
+	notifications := 0
+	w.SetOnChange(func() { notifications++ })
 
 	w.handleEvent(Event{
 		Action: "destroy",
 		Actor: struct {
 			ID         string            `json:"ID"`
 			Attributes map[string]string `json:"Attributes"`
-		}{ID: "xyz789"},
+		}{ID: "abc123"},
 	})
 
 	if w.ServiceCount() != 0 {
 		t.Errorf("service should be removed after destroy, got %d", w.ServiceCount())
+	}
+	if notifications != 1 {
+		t.Errorf("expected exactly 1 onChange, got %d", notifications)
 	}
 }
 

@@ -30,6 +30,7 @@ type regDockerWatcherStub struct{}
 
 func (s *regDockerWatcherStub) Services() []docker.DiscoveredService { return nil }
 func (s *regDockerWatcherStub) ServiceCount() int                    { return 0 }
+func (s *regDockerWatcherStub) Stats() docker.WatcherStats           { return docker.WatcherStats{} }
 
 func TestDockerWatcher_PublishAtomicallyWhileServing(t *testing.T) {
 	d := newTestDashboard(t, "dash-key")

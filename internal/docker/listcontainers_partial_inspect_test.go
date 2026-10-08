@@ -33,6 +33,12 @@ case "$cmd" in
 		printf '%s\n' '{"ID":"def4567890123456bbbbbbbbbbbbbbbb"}'
 		;;
 	inspect)
+		# Completeness re-probe for a single missing container:
+		# inspect --format={{.State.Running}} <id>
+		if [ "$1" = "--format={{.State.Running}}" ]; then
+			echo "Error response from daemon: No such container: $2" >&2
+			exit 1
+		fi
 		# Real docker CLI behavior on a missing ID: survivors to stdout,
 		# error to stderr, exit 1.
 		printf '%s' '[{"Id":"abc123def4567890aaaaaaaaaaaaaaaa","Name":"/web1","Config":{"Labels":{"gwaf.enable":"true","gwaf.host":"web.example.com"}},"State":{"Status":"running"},"NetworkSettings":{"Networks":{"bridge":{"IPAddress":"172.17.0.2","Gateway":"172.17.0.1","NetworkID":"net1"}}}}]'

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -377,45 +378,84 @@ func TestPortBinding_Parsing(t *testing.T) {
 // --- handleEvent: die ---
 
 func TestWatcher_HandleEvent_Die(t *testing.T) {
-	w := NewWatcher(nil, "gwaf", "bridge", time.Second)
+	w := NewWatcher(lifecycleEventClient(t), "gwaf", "bridge", time.Second)
 	w.SetLogger(func(_, _ string) {})
+	if !w.sync() {
+		t.Fatal("expected baseline sync to establish the service")
+	}
 
-	w.services["xyz"] = &DiscoveredService{ContainerID: "xyz", IPAddress: "10.0.0.1", Port: 80}
-
-	changed := false
-	w.SetOnChange(func() { changed = true })
+	notifications := 0
+	w.SetOnChange(func() { notifications++ })
 
 	evt := Event{Action: "die"}
-	evt.Actor.ID = "xyz"
-	evt.Actor.Attributes = map[string]string{"name": "svc"}
+	evt.Actor.ID = "abc123"
+	evt.Actor.Attributes = map[string]string{"name": "test-app"}
 	w.handleEvent(evt)
 
-	if !changed {
-		t.Error("expected onChange on die event")
-	}
+	// The die event converges only through a new complete snapshot.
 	if w.ServiceCount() != 0 {
-		t.Error("expected 0 services after die event")
+		t.Error("expected 0 services after die event confirmed by snapshot")
+	}
+	if notifications != 1 {
+		t.Errorf("expected exactly 1 onChange, got %d", notifications)
 	}
 }
 
 // --- handleEvent: start (with Docker client, sync may fail) ---
 
 func TestWatcher_HandleEvent_Start_WithClient(t *testing.T) {
-	c := NewClient("")
+	// Client whose listing always fails — a start event must not publish a
+	// change when the snapshot cannot be read.
+	c := makeClientWithCmdFunc(func(_ context.Context, _ ...string) (string, error) {
+		return "", fmt.Errorf("docker daemon not running")
+	})
 	w := NewWatcher(c, "gwaf", "bridge", time.Second)
 	w.SetLogger(func(_, _ string) {})
 
-	changed := false
-	w.SetOnChange(func() { changed = true })
+	notifications := 0
+	w.SetOnChange(func() { notifications++ })
 
 	evt := Event{Action: "start"}
 	evt.Actor.ID = "abc123"
 	evt.Actor.Attributes = map[string]string{"name": "test-app"}
 	w.handleEvent(evt)
 
-	// sync fails without Docker but onChange should still be called
-	if !changed {
-		t.Error("expected onChange to be called on start event")
+	if notifications != 0 {
+		t.Errorf("expected no onChange when the start-event resync fails, got %d", notifications)
+	}
+	stats := w.Stats()
+	if stats.LastSyncOK {
+		t.Error("expected last sync to be marked failed")
+	}
+	if stats.Stale {
+		t.Error("stale must be false with no retained snapshot")
+	}
+}
+
+// TestWatcher_HandleEvent_Start_NoChange verifies that a start event whose
+// resync returns the identical snapshot does not rebuild the runtime.
+func TestWatcher_HandleEvent_Start_NoChange(t *testing.T) {
+	c := makeClientWithCmdFunc(func(_ context.Context, args ...string) (string, error) {
+		if len(args) > 0 && args[0] == "ps" {
+			return `{"ID":"abc123"}`, nil
+		}
+		return makeInspectJSON("abc123", "test-app", "test.example.com", "8080"), nil
+	})
+	w := NewWatcher(c, "gwaf", "bridge", time.Second)
+	w.SetLogger(func(_, _ string) {})
+	if !w.sync() {
+		t.Fatal("expected baseline sync to establish the service")
+	}
+
+	notifications := 0
+	w.SetOnChange(func() { notifications++ })
+
+	evt := Event{Action: "start"}
+	evt.Actor.ID = "abc123"
+	w.handleEvent(evt)
+
+	if notifications != 0 {
+		t.Errorf("expected no onChange for an unchanged snapshot, got %d", notifications)
 	}
 }
 
@@ -1308,21 +1348,31 @@ func TestWatcher_loop_StopOnSecondIteration(t *testing.T) {
 	w.Stop()
 }
 
-// TestWatcher_pollLoop_Tick exercises the ticker path in pollLoop.
-func TestWatcher_pollLoop_Tick(t *testing.T) {
+// TestWatcher_RunPeriodicSync_Tick exercises the background periodic
+// snapshot ticker that runs in both event-stream and fallback modes.
+func TestWatcher_RunPeriodicSync_Tick(t *testing.T) {
 	c := makeClientWithCmdFunc(func(_ context.Context, args ...string) (string, error) {
 		return "", nil
 	})
 	w := NewWatcher(c, "gwaf", "bridge", 20*time.Millisecond)
 	w.SetLogger(func(_, _ string) {})
 
-	go func() {
-		// Let it tick once, then stop
-		time.Sleep(40 * time.Millisecond)
-		w.Stop()
-	}()
+	w.wg.Add(1)
+	go w.runPeriodicSync()
 
-	w.pollLoop()
+	time.Sleep(50 * time.Millisecond)
+	close(w.stopCh)
+
+	done := make(chan struct{})
+	go func() {
+		w.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("periodic sync goroutine did not stop")
+	}
 }
 
 // TestClient_StreamEvents_WithHostFlag verifies StreamEvents prepends --host
@@ -1399,9 +1449,9 @@ func TestAutoDetectPort_EmptyPorts(t *testing.T) {
 	}
 }
 
-// TestWatcher_pollLoop_WithChange verifies pollLoop calls notifyChange when
-// sync detects a change.
-func TestWatcher_pollLoop_WithChange(t *testing.T) {
+// TestWatcher_RunPeriodicSync_ConvergesChange verifies the background
+// periodic ticker discovers and publishes a service from an empty state.
+func TestWatcher_RunPeriodicSync_ConvergesChange(t *testing.T) {
 	inspectJSON := `[{
 		"Id": "abc123",
 		"Name": "/my-api",
@@ -1423,17 +1473,31 @@ func TestWatcher_pollLoop_WithChange(t *testing.T) {
 	w := NewWatcher(c, "gwaf", "bridge", 20*time.Millisecond)
 	w.SetLogger(func(_, _ string) {})
 
-	changed := false
-	w.SetOnChange(func() { changed = true })
+	var changed atomic.Bool
+	w.SetOnChange(func() { changed.Store(true) })
 
+	w.wg.Add(1)
+	go w.runPeriodicSync()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !changed.Load() {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	close(w.stopCh)
+	done := make(chan struct{})
 	go func() {
-		time.Sleep(50 * time.Millisecond)
-		w.Stop()
+		w.wg.Wait()
+		close(done)
 	}()
-	w.pollLoop()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("periodic sync goroutine did not stop")
+	}
 
-	if !changed {
-		t.Error("expected notifyChange to be called when services change")
+	if !changed.Load() {
+		t.Error("expected periodic sync to publish the discovered service")
 	}
 }
 

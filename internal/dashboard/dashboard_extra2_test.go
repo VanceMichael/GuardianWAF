@@ -79,6 +79,7 @@ func (m *mockAIAnalyzer) ManualAnalyze(evts []engine.Event) (*ai.AnalysisResult,
 
 type mockDockerWatcher struct {
 	services []docker.DiscoveredService
+	stats    *docker.WatcherStats
 }
 
 func (m *mockDockerWatcher) Services() []docker.DiscoveredService {
@@ -87,6 +88,17 @@ func (m *mockDockerWatcher) Services() []docker.DiscoveredService {
 
 func (m *mockDockerWatcher) ServiceCount() int {
 	return len(m.services)
+}
+
+func (m *mockDockerWatcher) Stats() docker.WatcherStats {
+	if m.stats != nil {
+		return *m.stats
+	}
+	return docker.WatcherStats{
+		LastSyncOK:   true,
+		Converged:    true,
+		ServiceCount: len(m.services),
+	}
 }
 
 // =====================================================================

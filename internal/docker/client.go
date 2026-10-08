@@ -133,6 +133,15 @@ type Event struct {
 	Time int64 `json:"time"`
 }
 
+// ErrIncompleteSnapshot signals that the complete container list could not
+// be obtained this round: at least one ID returned by `docker ps` was missing
+// from the batch inspect result while still confirmed running (or while its
+// removal could not be confirmed). Callers must retain their previous
+// complete snapshot and retry instead of applying the partial result —
+// otherwise a transient daemon hiccup would look like a still-running
+// container had vanished.
+var ErrIncompleteSnapshot = errors.New("incomplete docker snapshot")
+
 // Ping checks if Docker daemon is reachable.
 func (c *Client) Ping() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -210,6 +219,32 @@ func (c *Client) ListContainers(labelPrefix string) ([]Container, error) {
 		return nil, fmt.Errorf("inspecting containers: %w", inspectErr)
 	}
 
+	// Validate that the inspect result is a COMPLETE snapshot of the IDs
+	// `docker ps` returned. Batch inspect prints data only for the containers
+	// it could resolve; the only legitimate reason for an ID to be missing
+	// is that the container stopped or was removed between the two calls. A
+	// transient daemon failure can produce the same partial output with the
+	// container still running, which must not be mistaken for a removal:
+	// re-probe each missing ID individually and reject the whole result if
+	// one is still running or its state cannot be determined.
+	gotIDs := make(map[string]bool, len(details))
+	for _, d := range details {
+		gotIDs[d.ID] = true
+	}
+	for _, id := range ids {
+		if gotIDs[id] {
+			continue
+		}
+		state, stateErr := c.probeContainerState(id)
+		if stateErr != nil {
+			return nil, fmt.Errorf("verifying missing container after partial inspect: %w", stateErr)
+		}
+		if state == containerStateRunning {
+			return nil, fmt.Errorf("%w: %s is still running but missing from inspect", ErrIncompleteSnapshot, id)
+		}
+		// stopped/removed → its absence from the snapshot is correct; accept.
+	}
+
 	// Convert to Container format
 	containers := make([]Container, 0, len(details))
 	for _, d := range details {
@@ -244,6 +279,44 @@ func (c *Client) ListContainers(labelPrefix string) ([]Container, error) {
 	}
 
 	return containers, nil
+}
+
+// containerState classifies a single container's state during the
+// post-inspect completeness check.
+type containerState int
+
+const (
+	containerStateUnknown containerState = iota
+	containerStateRunning
+	containerStateStopped
+	containerStateRemoved
+)
+
+// probeContainerState re-checks one container that was returned by
+// `docker ps` but is absent from the batch inspect result. A fresh timeout
+// (independent of the listing context's deadline) bounds the call.
+func (c *Client) probeContainerState(id string) (containerState, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	out, err := c.dockerCmd(ctx, "inspect", "--format={{.State.Running}}", id)
+	if err == nil {
+		if strings.TrimSpace(out) == "true" {
+			return containerStateRunning, nil
+		}
+		// Explicit "false" (or any other value) — the container exists but
+		// is not running, so it legitimately dropped out of the `ps` set.
+		return containerStateStopped, nil
+	}
+
+	// The CLI reports vanished objects with a non-zero exit and a
+	// "No such object/container" diagnostic on stderr.
+	if strings.Contains(strings.ToLower(err.Error()), "no such") {
+		return containerStateRemoved, nil
+	}
+	// Any other failure (timeout, transport error, unknown CLI error) means
+	// the state is undetermined — the caller must reject the partial list.
+	return containerStateUnknown, err
 }
 
 // InspectContainer returns detailed info about a container.

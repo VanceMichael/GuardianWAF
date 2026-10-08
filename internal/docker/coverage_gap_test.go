@@ -99,9 +99,10 @@ func TestSanitizeLogValueStripsControlCharacters(t *testing.T) {
 
 func TestWatcherPollLoopUsesDefaultIntervalWhenNonPositive(t *testing.T) {
 	w := NewWatcher(NewClient(""), "gwaf", "bridge", time.Second)
-	w.pollInterval = 0
 	w.SetLogger(func(_, _ string) {})
 
+	// pollLoop now only holds the loop goroutine until shutdown while the
+	// background periodic ticker performs the syncs.
 	done := make(chan struct{})
 	go func() {
 		w.pollLoop()

@@ -194,6 +194,21 @@ func BuildConfig(services []DiscoveredService, staticCfg *config.Config) *config
 
 	// Build upstreams from discovered services
 	for name, svcs := range groups {
+		// Sort group members deterministically: the batch inspect order is
+		// not stable, and svcs[0] supplies the upstream's LB strategy and
+		// health check. Without sorting, identical snapshots with members in
+		// a different order could produce a different merged config (and a
+		// spurious proxy rebuild) even though nothing effectively changed.
+		slices.SortFunc(svcs, func(a, b DiscoveredService) int {
+			if a.ContainerID < b.ContainerID {
+				return -1
+			}
+			if a.ContainerID > b.ContainerID {
+				return 1
+			}
+			return 0
+		})
+
 		// Skip if upstream already exists in static config
 		if existingUpstreams[name] {
 			continue

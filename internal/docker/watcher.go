@@ -19,10 +19,17 @@ type Watcher struct {
 	network      string
 	pollInterval time.Duration
 
+	// syncMu serializes snapshot refreshes (and their notifications) so a
+	// burst of events or an event overlapping a poll tick cannot interleave
+	// two list/inspect rounds or publish them out of order.
+	syncMu sync.Mutex
+
 	mu       sync.RWMutex
-	services map[string]*DiscoveredService // containerID → service
-	stopCh   chan struct{}
-	wg       sync.WaitGroup
+	services map[string]*DiscoveredService // containerID → service — the last
+	// complete, valid Docker snapshot. Only sync() may replace it, and only
+	// with the parsed result of a fully successful list+inspect round.
+	stopCh chan struct{}
+	wg     sync.WaitGroup
 
 	callbackMu sync.RWMutex
 	onChange   func()
@@ -32,15 +39,27 @@ type Watcher struct {
 	eventStreamConnected atomic.Bool
 	lastSyncOK           atomic.Bool
 	syncFailures         atomic.Int64
+	lastAttempt          atomic.Int64 // unix nano of last sync attempt
+	lastSuccess          atomic.Int64 // unix nano of last successful full sync
+	lastError            atomic.Value // string: last sync error
 }
 
 // WatcherStats contains bounded operational state for Docker auto-discovery.
 type WatcherStats struct {
-	Running              bool  `json:"running"`
-	EventStreamConnected bool  `json:"event_stream_connected"`
-	LastSyncOK           bool  `json:"last_sync_ok"`
-	SyncFailures         int64 `json:"sync_failures"`
-	ServiceCount         int   `json:"service_count"`
+	Running              bool      `json:"running"`
+	EventStreamConnected bool      `json:"event_stream_connected"`
+	LastSyncOK           bool      `json:"last_sync_ok"`
+	SyncFailures         int64     `json:"sync_failures"`
+	ServiceCount         int       `json:"service_count"`
+	LastAttempt          time.Time `json:"last_attempt,omitempty"`
+	LastSuccess          time.Time `json:"last_success,omitempty"`
+	LastError            string    `json:"last_error,omitempty"`
+	// Converged reports that the running state mirrors the latest complete
+	// snapshot. Stale reports that the most recent sync failed while an
+	// earlier snapshot remains in use — traffic still flows against the old
+	// routes/targets until a later sync succeeds.
+	Converged bool `json:"converged"`
+	Stale     bool `json:"stale"`
 }
 
 // NewWatcher creates a Docker container watcher.
@@ -85,11 +104,52 @@ func (w *Watcher) Start() {
 	w.running.Store(true)
 	w.safeLog("WARN", "Docker socket is mounted — if GuardianWAF is compromised, attackers can read all container configs, env vars, and network topology. Prefer a read-only socket proxy or restrict access to the daemon.")
 
-	// Initial sync
-	w.sync()
+	// Initial snapshot — published immediately so discovered routes/targets
+	// are in force from startup rather than waiting for the first event or
+	// an event-stream failure. refresh() notifies only when a complete
+	// snapshot differs from the empty starting state.
+	w.refresh("startup")
 
 	w.wg.Add(1)
 	go w.loop()
+
+	// Periodic full-snapshot sync running alongside event streaming: a
+	// container network change (or any event this filtered stream does not
+	// cover) converges within one poll interval even while the stream is
+	// healthy. Unchanged rounds are cheap — refresh() suppresses rebuilds.
+	w.wg.Add(1)
+	go w.runPeriodicSync()
+}
+
+// runPeriodicSync refreshes the snapshot on every poll interval in both
+// event-driven and fallback modes.
+func (w *Watcher) runPeriodicSync() {
+	defer w.wg.Done()
+
+	ticker := time.NewTicker(w.pollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			w.refresh("periodic")
+		case <-w.stopCh:
+			return
+		}
+	}
+}
+
+// refresh runs one snapshot sync and, when the snapshot changed, publishes
+// the change. Every discovery trigger — initial sync, Docker container
+// events, poll ticks — funnels through here, so every update of running
+// state derives from the same last complete, valid Docker snapshot. Failed
+// or unchanged rounds never reach the callback.
+func (w *Watcher) refresh(reason string) {
+	w.syncMu.Lock()
+	defer w.syncMu.Unlock()
+	if w.sync() {
+		w.notifyChange()
+	}
 }
 
 // Stop gracefully stops the watcher.
@@ -141,13 +201,27 @@ func (w *Watcher) ServiceCount() int {
 
 // Stats returns bounded operational state for metrics and dashboards.
 func (w *Watcher) Stats() WatcherStats {
-	return WatcherStats{
+	count := w.ServiceCount()
+	lastOK := w.lastSyncOK.Load()
+	lastErr, _ := w.lastError.Load().(string)
+
+	stats := WatcherStats{
 		Running:              w.running.Load(),
 		EventStreamConnected: w.eventStreamConnected.Load(),
-		LastSyncOK:           w.lastSyncOK.Load(),
+		LastSyncOK:           lastOK,
 		SyncFailures:         w.syncFailures.Load(),
-		ServiceCount:         w.ServiceCount(),
+		ServiceCount:         count,
+		LastError:            lastErr,
+		Converged:            lastOK,
+		Stale:                !lastOK && count > 0,
 	}
+	if v := w.lastAttempt.Load(); v > 0 {
+		stats.LastAttempt = time.Unix(0, v)
+	}
+	if v := w.lastSuccess.Load(); v > 0 {
+		stats.LastSuccess = time.Unix(0, v)
+	}
+	return stats
 }
 
 // loop is the main watcher loop that tries event streaming with poll fallback.
@@ -235,86 +309,115 @@ func (w *Watcher) streamEvents() error {
 	}
 }
 
-// pollLoop falls back to periodic polling when event streaming isn't available.
+// pollLoop holds the main loop goroutine after the event stream disconnects.
+// Periodic convergence is supplied by the background ticker started in
+// Start (which keeps running in this mode), so this only blocks until
+// shutdown — the fallback behavior is otherwise identical to before.
 func (w *Watcher) pollLoop() {
-	pollInterval := w.pollInterval
-	if pollInterval <= 0 {
-		pollInterval = 10 * time.Second
-	}
-	ticker := time.NewTicker(pollInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			changed := w.sync()
-			if changed {
-				w.notifyChange()
-			}
-
-		case <-w.stopCh:
-			return
-		}
-	}
+	<-w.stopCh
 }
 
-// handleEvent processes a single Docker event.
+// handleEvent processes a single Docker event. Container lifecycle events
+// never mutate the service set directly: each one re-reads a complete
+// snapshot. This makes stop/destroy/remove deterministic (the container is
+// absent from a successful list) and safe across restarts (die followed by
+// start: a failed resync keeps the old snapshot instead of leaving the
+// container half-deleted).
 func (w *Watcher) handleEvent(event Event) {
 	switch event.Action {
-	case "start":
-		w.safeLog("info", "Docker: container started: "+sanitizeLogValue(event.Actor.Attributes["name"]))
-		w.sync()
-		w.notifyChange()
-
-	case "stop", "die", "destroy":
-		w.safeLog("info", "Docker: container stopped: "+sanitizeLogValue(event.Actor.Attributes["name"]))
-		w.mu.Lock()
-		delete(w.services, event.Actor.ID)
-		w.mu.Unlock()
-		w.notifyChange()
+	case "start", "stop", "die", "destroy":
+		name := sanitizeLogValue(event.Actor.Attributes["name"])
+		w.safeLog("info", "Docker: container "+event.Action+": "+name+" — resyncing snapshot")
+		w.refresh("event:" + event.Action)
 	}
 }
 
-// sync fetches the current container list and updates the services map.
-// Returns true if services changed.
+// sync fetches the current container list and atomically replaces the
+// services map only with a complete snapshot that actually differs.
+// Returns true when the snapshot changed and was applied.
 func (w *Watcher) sync() bool {
+	w.lastAttempt.Store(time.Now().UnixNano())
+
 	containers, err := w.client.ListContainers(w.labelPrefix)
 	if err != nil {
-		w.lastSyncOK.Store(false)
-		w.syncFailures.Add(1)
-		w.safeLog("warn", "Docker: list containers failed: "+err.Error())
+		w.recordSyncFailure(err)
 		return false
 	}
+
+	wasStale := !w.lastSyncOK.Load()
 	w.lastSyncOK.Store(true)
+	w.lastSuccess.Store(time.Now().UnixNano())
+	w.lastError.Store("")
 
 	services := DiscoverFromContainers(containers, w.labelPrefix, w.network)
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	// Check if services actually changed
-	if len(services) == len(w.services) {
-		changed := false
-		for _, svc := range services {
-			existing, ok := w.services[svc.ContainerID]
-			if !ok || existing.TargetURL() != svc.TargetURL() || existing.Host != svc.Host {
-				changed = true
-				break
-			}
+	// Full-field comparison: the previous check compared only the target URL
+	// and host, so label changes to path, port, weight, load-balancer,
+	// strip-prefix, TLS or health-check parameters never converged until an
+	// unrelated change happened. Every field of DiscoveredService is
+	// comparable and every derived value (network IP, port) is now chosen
+	// deterministically, so identical rounds compare equal.
+	if !snapshotChanged(w.services, services) {
+		// A successful read of an unchanged snapshot still ends a stale
+		// period: state flips to converged above without rebuilding.
+		if wasStale {
+			w.safeLog("info", "Docker: sync recovered — snapshot unchanged, running state confirmed against the latest snapshot")
 		}
-		if !changed {
-			return false
-		}
+		return false
 	}
 
-	// Rebuild services map
-	w.services = make(map[string]*DiscoveredService, len(services))
+	// Replace the map wholesale only after a complete, changed snapshot —
+	// failed or partial list calls never reach this point, so the previous
+	// snapshot stays intact for the duration of any Docker outage.
+	next := make(map[string]*DiscoveredService, len(services))
 	for i := range services {
-		w.services[services[i].ContainerID] = &services[i]
+		s := services[i]
+		next[s.ContainerID] = &s
 	}
+	w.services = next
 
-	w.safeLog("info", "Docker: discovered "+itoa(len(services))+" services")
+	w.safeLog("info", "Docker: snapshot converged ("+itoa(len(services))+" services)")
+	if wasStale {
+		w.safeLog("info", "Docker: sync recovered after failure — running state now matches the latest snapshot")
+	}
 	return true
+}
+
+// snapshotChanged reports whether the next service list differs from the
+// current map: different cardinality, an added/removed container ID, or any
+// field change on a surviving container.
+func snapshotChanged(current map[string]*DiscoveredService, next []DiscoveredService) bool {
+	if len(current) != len(next) {
+		return true
+	}
+	for i := range next {
+		existing, ok := current[next[i].ContainerID]
+		if !ok || *existing != next[i] {
+			return true
+		}
+	}
+	return false
+}
+
+// recordSyncFailure marks the sync failed and records the diagnostic while
+// leaving the current snapshot (and therefore routes, target pools and
+// health checkers) untouched. The log line states explicitly whether the
+// process is serving a retained snapshot or has none.
+func (w *Watcher) recordSyncFailure(err error) {
+	w.lastSyncOK.Store(false)
+	w.syncFailures.Add(1)
+	msg := sanitizeLogValue(err.Error())
+	w.lastError.Store(msg)
+
+	retained := w.ServiceCount()
+	if retained > 0 {
+		w.safeLog("warn", "Docker: sync failed: "+msg+" — retaining last valid snapshot ("+itoa(retained)+" services); next sync will retry")
+	} else {
+		w.safeLog("warn", "Docker: sync failed: "+msg+" — no previous snapshot available; routing stays on static configuration")
+	}
 }
 
 // notifyChange calls the onChange callback if set.
