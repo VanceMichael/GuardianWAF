@@ -350,20 +350,28 @@ func (a *mcpEngineAdapter) TestRequest(method, urlStr string, headers map[string
 func (a *mcpEngineAdapter) GetAlertingStatus() any {
 	if a.alertMgr == nil {
 		return map[string]any{
-			"enabled":       false,
-			"webhook_count": 0,
-			"email_count":   0,
-			"sent":          0,
-			"failed":        0,
+			"enabled":             false,
+			"webhook_count":       0,
+			"email_count":         0,
+			"sent":                0,
+			"failed":              0,
+			"dropped":             0,
+			"cooldown_suppressed": 0,
+			"inflight_suppressed": 0,
+			"in_flight":           0,
 		}
 	}
 	stats := a.alertMgr.GetStats()
 	return map[string]any{
-		"enabled":       true,
-		"webhook_count": stats.WebhookCount,
-		"email_count":   stats.EmailCount,
-		"sent":          stats.Sent,
-		"failed":        stats.Failed,
+		"enabled":             true,
+		"webhook_count":       stats.WebhookCount,
+		"email_count":         stats.EmailCount,
+		"sent":                stats.Sent,
+		"failed":              stats.Failed,
+		"dropped":             stats.Dropped,
+		"cooldown_suppressed": stats.CooldownSuppressed,
+		"inflight_suppressed": stats.InflightSuppressed,
+		"in_flight":           stats.InFlight,
 	}
 }
 

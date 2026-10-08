@@ -501,11 +501,19 @@ func TestValidateHostNotPrivate_Multicast(t *testing.T) {
 
 // --- HandleEvent: webhook with explicit cooldown=0 path ---
 
-// TestHandleEvent_ZeroCooldown tests that events are not suppressed when cooldown is zero.
+// TestHandleEvent_ZeroCooldown verifies the delivery lifecycle when the
+// target cooldown is disabled: concurrent same-key events cannot bypass
+// in-flight ownership (exactly one wire request), but once that delivery
+// completes without committing a cooldown, the next matching event is
+// delivered immediately.
 func TestHandleEvent_ZeroCooldown(t *testing.T) {
-	var mu atomic.Int64
+	started := make(chan struct{}, 32)
+	release := make(chan struct{})
+	var calls atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Add(1)
+		calls.Add(1)
+		started <- struct{}{}
+		<-release
 		w.WriteHeader(200)
 	}))
 	defer srv.Close()
@@ -513,16 +521,41 @@ func TestHandleEvent_ZeroCooldown(t *testing.T) {
 	m := NewManager([]WebhookTarget{
 		{Name: "no-cd", URL: srv.URL, Type: "generic", Events: []string{"block"}, Cooldown: 0},
 	})
-	// Override cooldown to 0 after construction (NewManager defaults to 30s when 0)
+	// Override cooldown to 0 after construction (NewManager defaults to 30s).
 	m.webhooks[0].cooldown = 0
+	m.webhooks[0].flights.cooldown = 0
 
-	// Both events should fire (no cooldown suppression)
+	// First event owns the key and blocks inside delivery.
 	m.HandleEvent(testEvent(engine.ActionBlock, 80, "1.2.3.4"))
-	m.HandleEvent(testEvent(engine.ActionBlock, 80, "1.2.3.4"))
-	time.Sleep(200 * time.Millisecond)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first delivery did not start")
+	}
 
-	if mu.Load() != 2 {
-		t.Errorf("expected 2 webhooks (no cooldown), got %d", mu.Load())
+	// A concurrent same-key event must not bypass in-flight ownership:
+	// no second wire request, counted as in-flight suppression.
+	m.HandleEvent(testEvent(engine.ActionBlock, 80, "1.2.3.4"))
+	time.Sleep(50 * time.Millisecond)
+	if calls.Load() != 1 {
+		t.Fatalf("concurrent event bypassed in-flight ownership: %d deliveries", calls.Load())
+	}
+	if got := m.GetStats().InflightSuppressed; got != 1 {
+		t.Fatalf("InflightSuppressed = %d, want 1", got)
+	}
+
+	// The owner completes; with cooldown=0 nothing is committed, so the
+	// next matching event is delivered immediately.
+	close(release)
+	waitFor(t, func() bool { return m.GetStats().Sent == 1 }, time.Second)
+	m.HandleEvent(testEvent(engine.ActionBlock, 80, "1.2.3.4"))
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("third event did not start delivery")
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("expected 2 deliveries after ownership release, got %d", calls.Load())
 	}
 }
 
@@ -561,6 +594,7 @@ func TestHandleEvent_EmailZeroCooldown(t *testing.T) {
 	})
 	// Override cooldown to 0 after construction
 	m.emailTargets[0].cooldown = 0
+	m.emailTargets[0].flights.cooldown = 0
 
 	evt := &engine.Event{
 		ID: "evt-zero-cd", Timestamp: time.Now(), ClientIP: "1.2.3.4",
@@ -638,6 +672,7 @@ func TestHandleEvent_WebhookNoCooldownStore(t *testing.T) {
 	})
 	// Force cooldown to exactly 0 (NewManager defaults to 30s)
 	m.webhooks[0].cooldown = 0
+	m.webhooks[0].flights.cooldown = 0
 
 	evt := testEvent(engine.ActionBlock, 80, "1.2.3.4")
 	m.HandleEvent(evt)

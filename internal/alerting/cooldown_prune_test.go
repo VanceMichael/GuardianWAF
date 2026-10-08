@@ -87,6 +87,10 @@ func TestHandleEventPrunesExpiredWebhookCooldownEntries(t *testing.T) {
 	for i := 1; i <= 1000; i++ {
 		fireBlockEvent(m, fmt.Sprintf("10.%d.%d.%d", (i>>16)&255, (i>>8)&255, i&255))
 	}
+	// Wait for every accepted async delivery to settle — a late-settling
+	// goroutine would otherwise commit a fresh timestamp for an old event
+	// key after the assertions below.
+	waitFor(t, func() bool { return m.GetStats().InFlight == 0 }, 5*time.Second)
 	// Age every entry past the 50ms cooldown, then fire one fresh IP: the
 	// expired entries are garbage (the suppression check treats them as
 	// absent) and must be swept, while the fresh entry must survive.
@@ -94,6 +98,20 @@ func TestHandleEventPrunesExpiredWebhookCooldownEntries(t *testing.T) {
 	fireBlockEvent(m, "10.99.99.99")
 
 	fresh := "10.99.99.99"
+	// The fresh entry is committed by the delivery goroutine, not by
+	// HandleEvent itself — wait for settlement before inspecting.
+	waitFor(t, func() bool {
+		present := false
+		m.webhooks[0].lastFire.Range(func(k, _ any) bool {
+			if k == fresh {
+				present = true
+				return false
+			}
+			return true
+		})
+		return present
+	}, time.Second)
+
 	stale := 0
 	freshPresent := false
 	m.webhooks[0].lastFire.Range(func(k, v any) bool {

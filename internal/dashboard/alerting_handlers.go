@@ -48,10 +48,26 @@ func (d *Dashboard) handleAlertingStatus(w http.ResponseWriter, r *http.Request)
 	}
 
 	if as := d.getAlertingStats(); as != nil {
-		stats := as.GetAlertingStats()
-		if s, ok := stats.(map[string]any); ok {
+		// The production provider returns an alerting.Stats value; tests and
+		// alternate wiring may provide a map[string]any. Handle both so the
+		// lifecycle categories (delivered/failed/dropped/cooldown/in-flight)
+		// are reported honestly in every deployment.
+		switch s := as.GetAlertingStats().(type) {
+		case alerting.Stats:
+			result["sent"] = s.Sent
+			result["failed"] = s.Failed
+			result["dropped"] = s.Dropped
+			result["cooldown_suppressed"] = s.CooldownSuppressed
+			result["inflight_suppressed"] = s.InflightSuppressed
+			result["in_flight"] = s.InFlight
+		case map[string]any:
 			result["sent"] = s["sent"]
 			result["failed"] = s["failed"]
+			for _, k := range []string{"dropped", "cooldown_suppressed", "inflight_suppressed", "in_flight"} {
+				if v, ok := s[k]; ok {
+					result[k] = v
+				}
+			}
 		}
 	}
 

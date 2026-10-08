@@ -127,14 +127,26 @@ export default function AlertingPage() {
           </p>
         </div>
         {status && (
-          <div className="flex items-center gap-4 text-sm">
-            <div className="flex items-center gap-2">
-              <span className="text-muted-foreground">Sent:</span>
+          <div className="flex flex-wrap items-center justify-end gap-x-4 gap-y-1 text-sm">
+            <div className="flex items-center gap-2" title="Successfully delivered alerts">
+              <span className="text-muted-foreground">Delivered:</span>
               <span className="font-medium text-green-600">{status.sent || 0}</span>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2" title="Delivery attempted but failed">
               <span className="text-muted-foreground">Failed:</span>
               <span className="font-medium text-red-600">{status.failed || 0}</span>
+            </div>
+            <div className="flex items-center gap-2" title="Dropped before dispatch (dispatch slots full or shutdown)">
+              <span className="text-muted-foreground">Dropped:</span>
+              <span className="font-medium text-orange-600">{status.dropped || 0}</span>
+            </div>
+            <div className="flex items-center gap-2" title="Alerts currently being delivered">
+              <span className="text-muted-foreground">In-flight:</span>
+              <span className="font-medium text-blue-600">{status.in_flight || 0}</span>
+            </div>
+            <div className="flex items-center gap-2" title="Events suppressed by an active cooldown">
+              <span className="text-muted-foreground">Cooldown:</span>
+              <span className="font-medium text-gray-500">{status.cooldown_suppressed || 0}</span>
             </div>
           </div>
         )}

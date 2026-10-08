@@ -454,6 +454,16 @@ func writeAlertingMetrics(w http.ResponseWriter, mgr *alerting.Manager) {
 	fmt.Fprintln(w, "# TYPE guardianwaf_alert_targets_configured gauge")
 	fmt.Fprintf(w, "guardianwaf_alert_targets_configured{type=\"webhook\"} %d\n", stats.WebhookCount)
 	fmt.Fprintf(w, "guardianwaf_alert_targets_configured{type=\"email\"} %d\n", stats.EmailCount)
+
+	fmt.Fprintln(w, "# HELP guardianwaf_alert_manager_cooldown_suppressed_total Total matching events suppressed by a cooldown committed by a prior successful delivery.")
+	fmt.Fprintln(w, "# TYPE guardianwaf_alert_manager_cooldown_suppressed_total counter")
+	fmt.Fprintf(w, "guardianwaf_alert_manager_cooldown_suppressed_total %d\n", stats.CooldownSuppressed)
+	fmt.Fprintln(w, "# HELP guardianwaf_alert_manager_inflight_suppressed_total Total matching events not sent because an in-flight delivery already owned the target/event key.")
+	fmt.Fprintln(w, "# TYPE guardianwaf_alert_manager_inflight_suppressed_total counter")
+	fmt.Fprintf(w, "guardianwaf_alert_manager_inflight_suppressed_total %d\n", stats.InflightSuppressed)
+	fmt.Fprintln(w, "# HELP guardianwaf_alert_in_flight Alert deliveries currently in progress across all targets.")
+	fmt.Fprintln(w, "# TYPE guardianwaf_alert_in_flight gauge")
+	fmt.Fprintf(w, "guardianwaf_alert_in_flight %d\n", stats.InFlight)
 }
 
 func writeDockerDiscoveryMetrics(w http.ResponseWriter, enabled bool, watcher *dkr.Watcher) {

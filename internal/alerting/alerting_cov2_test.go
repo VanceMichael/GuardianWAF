@@ -185,6 +185,7 @@ func TestHandleEvent_BothWebhookAndEmail(t *testing.T) {
 		},
 	)
 	m.emailTargets[0].cooldown = 0
+	m.emailTargets[0].flights.cooldown = 0
 
 	evt := &engine.Event{
 		ID: "evt-both", Timestamp: time.Now(), ClientIP: "1.2.3.4",
@@ -465,6 +466,7 @@ func TestHandleEvent_EmailSendExercisesGoroutine(t *testing.T) {
 		},
 	})
 	m.emailTargets[0].cooldown = 0
+	m.emailTargets[0].flights.cooldown = 0
 	// Use a normal logger — SendEmail will fail (connection refused) and call log("error", ...).
 	// This exercises the email goroutine path without triggering the recover block.
 	m.SetLogger(func(level, msg string) {})
@@ -493,6 +495,7 @@ func TestHandleEvent_EmailPanicViaLogFn(t *testing.T) {
 		},
 	})
 	m.emailTargets[0].cooldown = 0
+	m.emailTargets[0].flights.cooldown = 0
 	// The log function will panic when SendEmail tries to log an error.
 	// However, the recover block also calls m.log, which will panic again,
 	// causing the goroutine to crash. The test process is not affected

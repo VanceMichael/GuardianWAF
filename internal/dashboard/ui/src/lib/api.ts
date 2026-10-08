@@ -231,6 +231,10 @@ export interface Stats {
 export interface AlertingStats {
   sent: number
   failed: number
+  dropped?: number
+  cooldown_suppressed?: number
+  inflight_suppressed?: number
+  in_flight?: number
   webhook_count: number
   email_count: number
   email?: {
@@ -421,6 +425,10 @@ export interface AlertingStatusResponse {
   email_count: number
   sent?: number
   failed?: number
+  dropped?: number
+  cooldown_suppressed?: number
+  inflight_suppressed?: number
+  in_flight?: number
   webhooks: WebhookConfig[]
   emails: EmailConfig[]
 }

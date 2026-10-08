@@ -68,9 +68,12 @@ type Manager struct {
 	closing    atomic.Bool
 
 	// Stats
-	sent    atomic.Int64
-	failed  atomic.Int64
-	dropped atomic.Int64
+	sent               atomic.Int64
+	failed             atomic.Int64
+	dropped            atomic.Int64
+	cooldownSuppressed atomic.Int64
+	inflightSuppressed atomic.Int64
+	inFlight           atomic.Int64
 }
 
 const maxAlertDispatchConcurrency = 32
@@ -78,18 +81,35 @@ const maxAlertDispatchConcurrency = 32
 type webhook struct {
 	config   WebhookTarget
 	cooldown time.Duration
-	lastFire *sync.Map // IP → time.Time
+	lastFire *sync.Map // IP → cooldown timestamp of last SUCCESSFUL delivery
+	flights  *flightState
+}
+
+// newWebhookEntry builds a webhook target and its private delivery-lifecycle
+// state. The flightState is never shared with another target, so a target
+// removed and later re-added under the same name gets fresh state that old
+// goroutines cannot reach.
+func newWebhookEntry(t WebhookTarget) webhook {
+	cd := t.Cooldown
+	if cd <= 0 {
+		cd = 30 * time.Second
+	}
+	lf := &sync.Map{}
+	return webhook{config: t, cooldown: cd, lastFire: lf, flights: newFlightState(cd, lf)}
 }
 
 // Stats holds alerting statistics.
 type Stats struct {
-	Sent         int64      `json:"sent"`
-	Failed       int64      `json:"failed"`
-	Dropped      int64      `json:"dropped"`
-	WebhookCount int        `json:"webhook_count"`
-	EmailCount   int        `json:"email_count"`
-	MaxDispatch  int        `json:"max_dispatch"`
-	Email        EmailStats `json:"email,omitempty"`
+	Sent               int64      `json:"sent"`
+	Failed             int64      `json:"failed"`
+	Dropped            int64      `json:"dropped"`
+	CooldownSuppressed int64      `json:"cooldown_suppressed"`
+	InflightSuppressed int64      `json:"inflight_suppressed"`
+	InFlight           int64      `json:"in_flight"`
+	WebhookCount       int        `json:"webhook_count"`
+	EmailCount         int        `json:"email_count"`
+	MaxDispatch        int        `json:"max_dispatch"`
+	Email              EmailStats `json:"email,omitempty"`
 }
 
 // NewManager creates an alerting manager with the given webhook targets.
@@ -125,12 +145,7 @@ func NewManager(targets []WebhookTarget) *Manager {
 				continue
 			}
 		}
-		wh := webhook{config: t, lastFire: &sync.Map{}}
-		wh.cooldown = t.Cooldown
-		if wh.cooldown <= 0 {
-			wh.cooldown = 30 * time.Second
-		}
-		m.webhooks = append(m.webhooks, wh)
+		m.webhooks = append(m.webhooks, newWebhookEntry(t))
 	}
 
 	m.logFn.Store(func(_, _ string) {})
@@ -172,13 +187,16 @@ func (m *Manager) GetStats() Stats {
 	ec := len(m.emailTargets)
 	m.mu.RUnlock()
 	return Stats{
-		Sent:         m.sent.Load(),
-		Failed:       m.failed.Load(),
-		Dropped:      m.dropped.Load(),
-		WebhookCount: wc,
-		EmailCount:   ec,
-		MaxDispatch:  cap(m.sem),
-		Email:        GetEmailStats(),
+		Sent:               m.sent.Load(),
+		Failed:             m.failed.Load(),
+		Dropped:            m.dropped.Load(),
+		CooldownSuppressed: m.cooldownSuppressed.Load(),
+		InflightSuppressed: m.inflightSuppressed.Load(),
+		InFlight:           m.inFlight.Load(),
+		WebhookCount:       wc,
+		EmailCount:         ec,
+		MaxDispatch:        cap(m.sem),
+		Email:              GetEmailStats(),
 	}
 }
 
@@ -229,32 +247,36 @@ func (m *Manager) HandleEvent(event *engine.Event) {
 			continue
 		}
 
-		// Cooldown per IP
-		if wh.cooldown > 0 {
-			if last, ok := wh.lastFire.Load(event.ClientIP); ok {
-				if t, _ := last.(time.Time); !t.IsZero() && time.Since(t) < wh.cooldown {
-					continue
-				}
-			}
-			wh.lastFire.Store(event.ClientIP, time.Now())
+		// Claim in-flight ownership for this (target, event key). A cooldown
+		// entry exists only after a SUCCESSFUL delivery, so failed or
+		// unenqueued attempts never suppress the next matching event.
+		key := event.ClientIP
+		switch wh.flights.claim(key) {
+		case claimCooldown:
+			m.cooldownSuppressed.Add(1)
+			continue
+		case claimInflight:
+			m.inflightSuppressed.Add(1)
+			continue
 		}
 
-		// Fire async with concurrency limit
-		switch m.dispatch(func() {
-			func(wc *WebhookTarget, a *Alert) {
-				defer func() {
-					if r := recover(); r != nil {
-						m.failed.Add(1)
-						m.log("error", fmt.Sprintf("webhook goroutine panic: %v", r))
-					}
-				}()
-				_ = m.send(wc, a) // fire-and-forget by design: alert pipeline must not block on delivery
-			}(&wh.config, &alert)
-		}) {
-		case dispatchFull:
-			m.dropped.Add(1)
-			m.failed.Add(1)
-		case dispatchClosed:
+		// Fire async with concurrency limit. The claim settles inside the
+		// goroutine (cooldown on success, release on failure/panic). If the
+		// attempt is not accepted, release the claim synchronously so a
+		// later event can retry immediately.
+		cfg := wh.config
+		a := alert
+		flights := wh.flights
+		if res := m.dispatch(func() {
+			m.inFlight.Add(1)
+			defer m.inFlight.Add(-1)
+			if err := m.deliverWebhook(&cfg, &a); err != nil {
+				flights.release(key)
+				return
+			}
+			flights.commitSuccess(key)
+		}); res != dispatchOK {
+			flights.release(key)
 			m.dropped.Add(1)
 			m.failed.Add(1)
 		}
@@ -274,32 +296,29 @@ func (m *Manager) HandleEvent(event *engine.Event) {
 			continue
 		}
 
-		// Cooldown per IP
-		if et.cooldown > 0 {
-			if last, ok := et.lastFire.Load(event.ClientIP); ok {
-				if t, _ := last.(time.Time); !t.IsZero() && time.Since(t) < et.cooldown {
-					continue
-				}
-			}
-			et.lastFire.Store(event.ClientIP, time.Now())
+		// Claim in-flight ownership, same lifecycle as webhooks.
+		key := event.ClientIP
+		switch et.flights.claim(key) {
+		case claimCooldown:
+			m.cooldownSuppressed.Add(1)
+			continue
+		case claimInflight:
+			m.inflightSuppressed.Add(1)
+			continue
 		}
 
 		// Send email async (with same concurrency limit as webhooks)
-		switch m.dispatch(func() {
-			func(et *EmailTarget, ev *engine.Event) {
-				defer func() {
-					if r := recover(); r != nil {
-						m.failed.Add(1)
-						m.log("error", fmt.Sprintf("email goroutine panic: %v", r))
-					}
-				}()
-				_ = m.SendEmail(et, ev) // fire-and-forget by design: alert pipeline must not block on delivery
-			}(et, event)
-		}) {
-		case dispatchFull:
-			m.dropped.Add(1)
-			m.failed.Add(1)
-		case dispatchClosed:
+		target := et
+		if res := m.dispatch(func() {
+			m.inFlight.Add(1)
+			defer m.inFlight.Add(-1)
+			if err := m.deliverEmail(target, event); err != nil {
+				target.flights.release(key)
+				return
+			}
+			target.flights.commitSuccess(key)
+		}); res != dispatchOK {
+			target.flights.release(key)
 			m.dropped.Add(1)
 			m.failed.Add(1)
 		}
@@ -366,6 +385,78 @@ const (
 	dispatchFull
 )
 
+// flightState owns the per-event-key delivery lifecycle of one target:
+// exclusive in-flight ownership plus cooldown timestamps recorded only on
+// success. A separate instance is constructed for every target (including a
+// target re-added under an existing name), so a goroutine captured before a
+// delete/rebuild can only settle against its own detached state and can
+// never pollute the new target.
+type flightState struct {
+	cooldown time.Duration
+	lastFire *sync.Map // key(string) → time.Time of last successful delivery
+	mu       sync.Mutex
+	inflight map[string]struct{}
+}
+
+func newFlightState(cooldown time.Duration, lastFire *sync.Map) *flightState {
+	return &flightState{
+		cooldown: cooldown,
+		lastFire: lastFire,
+		inflight: make(map[string]struct{}),
+	}
+}
+
+type claimOutcome int
+
+const (
+	claimOK claimOutcome = iota
+	claimCooldown
+	claimInflight
+)
+
+// claim acquires exclusive delivery ownership for key. claimCooldown means
+// a prior SUCCESSFUL delivery is still within the target cooldown;
+// claimInflight means another attempt currently owns the key. On claimOK
+// the caller must settle exactly once via commitSuccess or release.
+func (f *flightState) claim(key string) claimOutcome {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.cooldown > 0 {
+		if last, ok := f.lastFire.Load(key); ok {
+			if t, _ := last.(time.Time); !t.IsZero() && time.Since(t) < f.cooldown {
+				return claimCooldown
+			}
+		}
+	}
+	if _, ok := f.inflight[key]; ok {
+		return claimInflight
+	}
+	f.inflight[key] = struct{}{}
+	return claimOK
+}
+
+// commitSuccess settles an owned attempt as delivered: ownership is
+// released and, when the target has a cooldown, the suppression timestamp
+// is stored so subsequent matching events are suppressed until it expires.
+func (f *flightState) commitSuccess(key string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.inflight, key)
+	if f.cooldown > 0 {
+		f.lastFire.Store(key, time.Now())
+	}
+}
+
+// release settles an owned attempt as failed, panicked, or not enqueued:
+// ownership is dropped without recording a cooldown, so the next matching
+// event can claim the key and be delivered immediately.
+func (f *flightState) release(key string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.inflight, key)
+}
+
 func (m *Manager) dispatch(fn func()) dispatchResult {
 	m.dispatchMu.Lock()
 	defer m.dispatchMu.Unlock()
@@ -418,6 +509,36 @@ func (m *Manager) CloseWithContext(ctx context.Context) error {
 // Close waits for in-flight alert deliveries without a timeout.
 func (m *Manager) Close() error {
 	return m.CloseWithContext(context.Background())
+}
+
+// deliverWebhook runs one webhook delivery and converts a panic into a
+// normal error. The delivery attempt itself (m.send) records the outcome
+// in sent/failed; a panic records failed here. The caller settles the
+// in-flight claim based on the returned error: release on any error,
+// commitSuccess only on nil.
+func (m *Manager) deliverWebhook(wc *WebhookTarget, a *Alert) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("webhook goroutine panic: %v", r)
+			m.failed.Add(1)
+			m.log("error", err.Error())
+		}
+	}()
+	return m.send(wc, a)
+}
+
+// deliverEmail is the SMTP equivalent of deliverWebhook: a panicking
+// delivery is turned into an error (failed counted once) so the claim is
+// released rather than wedged.
+func (m *Manager) deliverEmail(et *EmailTarget, ev *engine.Event) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("email goroutine panic: %v", r)
+			m.failed.Add(1)
+			m.log("error", err.Error())
+		}
+	}()
+	return m.SendEmail(et, ev)
 }
 
 // send delivers an alert to a webhook endpoint.
@@ -613,16 +734,8 @@ func (m *Manager) AddWebhook(target WebhookTarget) {
 		m.log("error", fmt.Sprintf("webhook %q rejected: %v", target.Name, err))
 		return
 	}
-	wh := webhook{
-		config:   target,
-		cooldown: target.Cooldown,
-		lastFire: &sync.Map{},
-	}
-	if wh.cooldown <= 0 {
-		wh.cooldown = 30 * time.Second
-	}
 	m.mu.Lock()
-	m.webhooks = append(m.webhooks, wh)
+	m.webhooks = append(m.webhooks, newWebhookEntry(target))
 	m.mu.Unlock()
 	m.log("info", fmt.Sprintf("Webhook target added: %s", target.Name))
 }

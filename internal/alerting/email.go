@@ -20,7 +20,8 @@ import (
 type EmailTarget struct {
 	config   config.EmailConfig
 	cooldown time.Duration
-	lastFire *sync.Map // IP → time.Time
+	lastFire *sync.Map // IP → cooldown timestamp of last SUCCESSFUL delivery
+	flights  *flightState
 }
 
 // EmailStats holds email alerting statistics.
@@ -83,10 +84,12 @@ func (m *Manager) SendEmail(target *EmailTarget, event *engine.Event) error {
 
 	if err != nil {
 		emailFailed.Add(1)
+		m.failed.Add(1)
 		m.log("error", fmt.Sprintf("failed to send email alert: %v", err))
 		return err
 	}
 	emailSent.Add(1)
+	m.sent.Add(1)
 	m.log("info", fmt.Sprintf("email alert sent to %s for event %s", strings.Join(cfg.To, ", "), event.ID))
 	return nil
 }
@@ -292,10 +295,12 @@ func NewEmailTarget(cfg config.EmailConfig) *EmailTarget {
 	if cooldown <= 0 {
 		cooldown = 5 * time.Minute // Default 5 minute cooldown for emails
 	}
+	lf := &sync.Map{}
 	return &EmailTarget{
 		config:   cfg,
 		cooldown: cooldown,
-		lastFire: &sync.Map{},
+		lastFire: lf,
+		flights:  newFlightState(cooldown, lf),
 	}
 }
 
